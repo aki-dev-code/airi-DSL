@@ -121,6 +121,20 @@ export const useLive2d = defineStore('live2d', () => {
     model,
 
     /**
+     * Clears all active expressions and restores the model parameters to their original state.
+     */
+    clearExpressions() {
+      for (const [fileName, resetFunc] of Object.entries(activeEmotionResets.value)) {
+        if (activeEmotionTimers.value[fileName]) {
+          clearTimeout(activeEmotionTimers.value[fileName])
+          delete activeEmotionTimers.value[fileName]
+        }
+        resetFunc()
+      }
+      activeExpressions.value = {}
+    },
+
+    /**
      * Trigger an emotion based on mapping or fallback.
      * Returns true if a mapping was found and triggered.
      */
@@ -135,13 +149,35 @@ export const useLive2d = defineStore('live2d', () => {
         let matched = availableExpressions.value.find(
           e => e.name.toLowerCase() === emotionKey.toLowerCase(),
         )
-        // 3. Smart fuzzy match (e.g. 'happy' matches 'exp_happy.exp3')
+        // 3. Smart fuzzy match using emotion keyword clusters.
+        // If the LLM requests an emotion in a known cluster (e.g. "mad" → anger cluster),
+        // broaden the search to all synonyms and Japanese equivalents for better model compatibility.
         if (!matched) {
+          const keyLower = emotionKey.toLowerCase()
+          let searchKeywords = [keyLower]
+
+          const emotionClusters = [
+            ['happy', 'smile', 'joy', 'laugh', 'glad', 'fun', '喜', '笑'],
+            ['angry', 'anger', 'mad', 'frown', 'disgust', 'upset', 'hate', '怒'],
+            ['sad', 'cry', 'tear', 'sorrow', 'depressed', '泣', '悲'],
+            ['surprise', 'shock', 'gasp', '驚'],
+            ['blush', 'shy', 'embarrass', 'red', '照', '恥'],
+            ['wink', 'smug', 'proud', 'heh', 'ドヤ'],
+            ['think', 'confused', 'what', '困', '思'],
+            ['sleep', 'close', '眠', '閉'],
+          ]
+
+          // Broaden the search keywords if the requested emotion belongs to a cluster
+          const matchedCluster = emotionClusters.find(cluster => cluster.some(k => keyLower.includes(k)))
+          if (matchedCluster) {
+            searchKeywords = matchedCluster
+          }
+
           matched = availableExpressions.value.find(
-            e => e.name.toLowerCase().includes(emotionKey.toLowerCase()) || emotionKey.toLowerCase().includes(e.name.toLowerCase().replace(/\.exp3$/, ''))
+            e => searchKeywords.some(k => e.name.toLowerCase().includes(k)) || keyLower.includes(e.name.toLowerCase().replace(/\.exp3$/, '')),
           )
         }
-        
+
         if (matched) {
           targetFileNames = [matched.fileName]
         }

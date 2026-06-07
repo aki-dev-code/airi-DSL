@@ -6,6 +6,7 @@ import type { PixiLive2DInternalModel } from '../../../composables/live2d'
 import JSZip from 'jszip'
 
 import { listenBeatSyncBeatSignal } from '@proj-airi/stage-shared/beat-sync'
+import { useDatingSimStore } from '@proj-airi/stage-ui/stores/dating-sim'
 import { useTheme } from '@proj-airi/ui'
 import { breakpointsTailwind, until, useBreakpoints, useBroadcastChannel, useDebounceFn } from '@vueuse/core'
 import { formatHex } from 'culori'
@@ -32,7 +33,6 @@ import { useLive2d } from '../../../stores/live2d'
 import { setOnZipLoaded } from '../../../utils/live2d-zip-loader'
 import { OPFSCacheV2 } from '../../../utils/opfs-loader'
 import { extractArtMeshColorsFromVTube, listVTubeColorRelatedKeys } from '../../../utils/vtube-artmesh-colors'
-import { useDatingSimStore } from '@proj-airi/stage-ui/stores/dating-sim'
 
 const props = withDefaults(defineProps<{
   modelSrc?: string
@@ -1553,8 +1553,99 @@ function onCanvasMouseMove(event: MouseEvent) {
   }
 }
 
+// Body-part categories for expression pooling, covering common English and Japanese naming conventions.
+// NOTICE: 'chest'/'belly' are intentionally kept in the general body zone (not intimate) since many
+// models use them for normal torso-tap areas. Only unambiguously intimate terms go in the strict private list.
+const BODY_PART_KEYWORDS = {
+  // Sensitive areas: Chest, bust, crotch, butt, etc. → blushing, embarrassed, or shocked
+  intimate: ['bust', 'chest', 'boob', 'breast', 'crotch', 'privat', 'nsfw', 'skirt', 'butt', 'hip', 'ass', 'bottom', 'belly', 'tummy', 'stomach', '胸', 'おっぱい', '股間', '陰部', 'スカート', 'パンツ', 'お尻', '尻', 'ケツ', 'お腹', '腹'],
+  // Head / face / hair → happy/blush/shy (headpat)
+  head: ['head', 'face', 'hair', 'cheek', 'forehead', '頭', 'アタマ', '顔', '髪', '頬', 'おでこ'],
+  // Hands / arms → happy/curious (holding hands)
+  hand: ['hand', 'arm', 'finger', 'wrist', 'palm', '手', '腕', '指', '手首'],
+  // Legs / feet → ticklish / giggle
+  leg: ['leg', 'thigh', 'knee', 'foot', 'feet', 'ankle', '脚', '足', 'もも', 'ひざ', '足首'],
+  // General torso if not captured by intimate (e.g. generic 'body')
+  body: ['torso', 'waist', 'body', '体'],
+} as const
+
+type BodyPartZone = 'intimate' | 'head' | 'hand' | 'body' | 'leg' | 'unknown'
+
+/**
+ * Classify a hit-area name string into a semantic body-part zone.
+ */
+function classifyHitAreaByName(name: string): BodyPartZone {
+  const lower = name.toLowerCase()
+  for (const [zone, keywords] of Object.entries(BODY_PART_KEYWORDS)) {
+    if ((keywords as readonly string[]).some(k => lower.includes(k))) {
+      return zone as BodyPartZone
+    }
+  }
+  return 'unknown'
+}
+
+/**
+ * Infer the body-part zone from normalized click position within the model's LOCAL bounding box.
+ * Used as a fallback when no named hit areas are defined on the model.
+ */
+function inferBodyPartFromLocalCoords(localX: number, localY: number, localBounds: { x: number, y: number, width: number, height: number }): BodyPartZone {
+  if (localBounds.width <= 0 || localBounds.height <= 0)
+    return 'unknown'
+
+  const normY = (localY - localBounds.y) / localBounds.height
+  const normX = (localX - localBounds.x) / localBounds.width
+
+  // Head zone (top 25%)
+  if (normY < 0.25)
+    return 'head'
+
+  // Upper body (25% to 55%)
+  if (normY < 0.55) {
+    // Outer 20% on each side -> hand/arm
+    if (normX < 0.20 || normX > 0.80)
+      return 'hand'
+
+    // Center chest (boobs) area -> intimate
+    if (normY > 0.30 && normY < 0.45 && normX > 0.30 && normX < 0.70)
+      return 'intimate'
+
+    return 'body'
+  }
+
+  // Lower torso / hips / crotch (55% to 75%)
+  if (normY < 0.75) {
+    // Center crotch / skirt area -> intimate
+    if (normY > 0.60 && normX > 0.35 && normX < 0.65)
+      return 'intimate'
+
+    return 'body'
+  }
+
+  // Legs / feet
+  return 'leg'
+}
+
+/** Map a body-part zone to a list of emotion keywords for expression selection. */
+function getEmotionKeywordsForZone(zone: BodyPartZone): string[] {
+  switch (zone) {
+    case 'intimate':
+      return ['angry', 'anger', 'mad', 'frown', 'disgust', 'upset', 'hate', '怒', 'blush', 'shy', 'embarrass', 'red', '照', '恥', 'surprise', 'shock', 'gasp', '驚']
+    case 'head':
+      return ['happy', 'smile', 'joy', 'laugh', 'glad', 'fun', '喜', '笑', 'wink', 'proud', 'smug', 'heh', 'ドヤ', 'blush', 'shy', '照', 'sleep', 'close', '眠', '閉']
+    case 'hand':
+      return ['happy', 'smile', 'fun', 'glad', '喜', '笑', 'wink', 'surprise', 'shock', '驚', 'confused', 'think', 'what', '困', '思']
+    case 'body':
+      return ['happy', 'smile', 'joy', 'glad', '喜', '笑', 'wink', 'surprised', '驚']
+    case 'leg':
+      return ['surprise', 'shock', 'gasp', '驚', 'happy', 'smile', 'laugh', '笑', 'confused', 'what', '困']
+    case 'unknown':
+    default:
+      return []
+  }
+}
+
 function onCanvasClick(event: MouseEvent) {
-  if (interactionMode.value !== 'tactile' || !model.value || !props.app)
+  if (!model.value || !props.app)
     return
 
   const canvasEl = props.app.view as HTMLCanvasElement
@@ -1569,35 +1660,75 @@ function onCanvasClick(event: MouseEvent) {
   const globalY = mouseY * (props.app.screen.height / rect.height)
 
   const hitAreas = model.value.hitTest(globalX, globalY)
+  let hitArea = ''
   if (hitAreas && hitAreas.length > 0) {
-    const hitArea = hitAreas[0]
-    console.info(`[Live2D Tactile] Clicked hit area: ${hitArea} at global(${globalX.toFixed(1)}, ${globalY.toFixed(1)})`)
+    hitArea = hitAreas[0]
+  }
 
-    const internalModel = model.value.internalModel
-    const motionManager = internalModel?.motionManager
-    if (!motionManager)
-      return
+  // --- Accurate fallback ---
+  // We use the model's logical canvas dimensions to avoid PIXI filter bounds issues.
+  const internalModel = model.value.internalModel
+  const logicalWidth = internalModel?.width || 0
+  const logicalHeight = internalModel?.height || 0
 
+  const localPt = model.value.toLocal({ x: globalX, y: globalY })
+
+  // A point is within the model if it falls inside the logical Live2D canvas (0 to width, 0 to height)
+  const isInsideLogicalBounds = logicalWidth > 0 && logicalHeight > 0
+    && localPt.x >= 0 && localPt.x <= logicalWidth
+    && localPt.y >= 0 && localPt.y <= logicalHeight
+
+  const clickedModel = hitArea !== '' || isInsideLogicalBounds
+
+  if (!clickedModel)
+    return
+
+  // --- Classify which body zone was touched ---
+  let bodyZone: BodyPartZone = 'unknown'
+  if (hitArea) {
+    bodyZone = classifyHitAreaByName(hitArea)
+    console.info(`[Live2D Tactile] Clicked hit area: "${hitArea}" → zone: "${bodyZone}" at global(${globalX.toFixed(1)}, ${globalY.toFixed(1)})`)
+  }
+
+  if (bodyZone === 'unknown') {
+    // If no hit area matched, infer from the exact normalized coordinates on the logical canvas
+    const localBounds = { x: 0, y: 0, width: logicalWidth, height: logicalHeight }
+    bodyZone = inferBodyPartFromLocalCoords(localPt.x, localPt.y, localBounds)
+    const reason = hitArea ? `hit area "${hitArea}" unrecognised` : 'no hit areas defined'
+    console.info(`[Live2D Tactile] Body zone inferred from coords (${reason}): "${bodyZone}"`)
+  }
+
+  // --- Motion playback ---
+  const motionManager = internalModel?.motionManager
+  if (motionManager) {
     const groups = Object.keys(motionManager.definitions || {})
 
-    // Smart matching rules for hitArea mapping to motion definitions:
-    // 1. Exact match (case insensitive)
-    let matchedGroup = groups.find(g => g.toLowerCase() === hitArea.toLowerCase())
-    // 2. Definition group starts with hitArea
-    if (!matchedGroup) {
-      matchedGroup = groups.find(g => g.toLowerCase().startsWith(hitArea.toLowerCase()))
+    // Smart matching rules for hitArea → motion group (only when we have a named area)
+    let matchedGroup: string | undefined
+    if (hitArea) {
+      matchedGroup = groups.find(g => g.toLowerCase() === hitArea.toLowerCase())
+        ?? groups.find(g => g.toLowerCase().startsWith(hitArea.toLowerCase()))
+        ?? groups.find(g => hitArea.toLowerCase().startsWith(g.toLowerCase()))
+        ?? groups.find(g => g.toLowerCase().includes(hitArea.toLowerCase()))
+        ?? groups.find(g => hitArea.toLowerCase().includes(g.toLowerCase()))
     }
-    // 3. HitArea starts with definition group
+
+    // When there is no named hit area, try to find a motion group by body zone name
     if (!matchedGroup) {
-      matchedGroup = groups.find(g => hitArea.toLowerCase().startsWith(g.toLowerCase()))
-    }
-    // 4. Definition group contains hitArea
-    if (!matchedGroup) {
-      matchedGroup = groups.find(g => g.toLowerCase().includes(hitArea.toLowerCase()))
-    }
-    // 5. HitArea contains definition group
-    if (!matchedGroup) {
-      matchedGroup = groups.find(g => hitArea.toLowerCase().includes(g.toLowerCase()))
+      const zoneMotionNames: Record<BodyPartZone, string[]> = {
+        head: ['head', 'hair', 'face', 'tap_head', 'headpat'],
+        hand: ['hand', 'arm', 'tap_hand'],
+        body: ['body', 'tap_body', 'chest', 'torso'],
+        intimate: ['tap_body', 'body'],
+        leg: ['leg', 'foot', 'tap_body'],
+        unknown: [],
+      }
+      const candidates = zoneMotionNames[bodyZone] || []
+      for (const candidate of candidates) {
+        matchedGroup = groups.find(g => g.toLowerCase().includes(candidate))
+        if (matchedGroup)
+          break
+      }
     }
 
     if (matchedGroup) {
@@ -1605,24 +1736,48 @@ function onCanvasClick(event: MouseEvent) {
       if (definitions && definitions.length > 0) {
         const randomIndex = Math.floor(Math.random() * definitions.length)
         const def = definitions[randomIndex]
-        console.info(`[Live2D Tactile] Playing motion for matched group: group="${matchedGroup}", index=${randomIndex}`)
-        
+        console.info(`[Live2D Tactile] Playing motion: group="${matchedGroup}", index=${randomIndex}`)
+
         // Pass the definition to the Dating Sim state machine (Special Sauce DSL)
         const datingSimStore = useDatingSimStore()
         const allowExecution = datingSimStore.executeJSONCommand(def)
-        
+
         if (allowExecution !== false) {
           model.value.motion(matchedGroup, randomIndex, MotionPriority.FORCE)
-        } else {
-          console.info(`[Live2D Tactile] Motion blocked by Dating Sim store bounds.`)
+        }
+        else {
+          console.info('[Live2D Tactile] Motion blocked by Dating Sim store bounds.')
         }
       }
     }
     else {
-      console.warn(`[Live2D Tactile] No matching motion group found starting with or related to hitArea: ${hitArea}`)
-      if (hitArea.toLowerCase().includes('body')) {
-        model.value.motion('tap_body')
+      console.info(`[Live2D Tactile] No matching motion group for zone "${bodyZone}" — skipping motion playback`)
+    }
+  }
+
+  // --- Dynamic tactile expression pooling ---
+  // Select an expression appropriate for the detected body zone.
+  // Prefer inactive expressions; fall back to purely random when no keyword match is found.
+  const choices = availableExpressions.value.filter(e => !activeExpressions.value[e.fileName])
+  if (choices.length > 0) {
+    const emotionKeywords = getEmotionKeywordsForZone(bodyZone)
+    let selectedExpression = null
+
+    if (emotionKeywords.length > 0) {
+      const emotionChoices = choices.filter(e => emotionKeywords.some(k => e.name.toLowerCase().includes(k)))
+      if (emotionChoices.length > 0) {
+        selectedExpression = emotionChoices[Math.floor(Math.random() * emotionChoices.length)]
       }
+    }
+
+    // Fallback: random inactive expression when no zone-specific match found
+    if (!selectedExpression) {
+      selectedExpression = choices[Math.floor(Math.random() * choices.length)]
+    }
+
+    if (selectedExpression) {
+      console.info(`[Live2D Tactile] Triggering expression: "${selectedExpression.name}" (zone: "${bodyZone}")`)
+      live2dStore.triggerEmotion(selectedExpression.name)
     }
   }
 }
@@ -1630,7 +1785,8 @@ function onCanvasClick(event: MouseEvent) {
 function setupCanvasListeners() {
   cleanupCanvasListeners()
 
-  if (interactionMode.value !== 'tactile' || !model.value || !props.app)
+  // Live2D models are 2D; always register click listener regardless of interactionMode.
+  if (!model.value || !props.app)
     return
 
   const canvasEl = props.app.view as HTMLCanvasElement

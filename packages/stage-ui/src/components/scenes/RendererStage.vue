@@ -292,7 +292,7 @@ function handleTriggerMotion(e: Event) {
   useLive2d().currentMotion = { group: detail }
 }
 function handleClearExp() {
-  useLive2d().activeExpressions = {}
+  useLive2d().clearExpressions()
 }
 function handleMotionsEnable(e: Event) {
   const detail = (e as CustomEvent).detail
