@@ -77,7 +77,7 @@ export default defineConfig({
   },
   build: {
     target: 'esnext',
-    sourcemap: true,
+    sourcemap: env.STAGE_WEB_SOURCEMAP === 'true',
   },
   worker: {
     format: 'es',
